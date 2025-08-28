@@ -1,6 +1,8 @@
 import React, { useState, useEffect, FormEvent, useCallback } from "react";
 import { createRoot } from "react-dom/client";
 import { GoogleGenAI } from "@google/genai";
+import { pb } from './lib/pocketbase'; // Import PocketBase
+import { RecordModel } from "pocketbase";
 
 // Fix: Add paypal to the Window interface to avoid TypeScript errors.
 declare global {
@@ -12,33 +14,12 @@ declare global {
 // --- Gemini API Initialization ---
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-// --- User Data Structure ---
-interface UserData {
-  password: string;
+// --- User Data Structure (matches PocketBase) ---
+interface UserData extends RecordModel {
+  email: string;
   credits: number;
-  profileImage: string | null;
+  avatar: string | null; // PocketBase uses 'avatar' for the field
 }
-
-// --- Falsa base de datos en localStorage ---
-const DB_KEY = 'betterimg_users_v2';
-
-const getUsers = (): Record<string, UserData> => {
-  try {
-    const users = localStorage.getItem(DB_KEY);
-    return users ? JSON.parse(users) : {};
-  } catch (error) {
-    console.error("Failed to parse users from localStorage", error);
-    return {};
-  }
-};
-
-const saveUsers = (users: Record<string, UserData>) => {
-  try {
-    localStorage.setItem(DB_KEY, JSON.stringify(users));
-  } catch (error) {
-    console.error("Failed to save users to localStorage", error);
-  }
-};
 
 // --- Icon Components ---
 const EyeIcon = () => (
@@ -193,16 +174,15 @@ const AuthForm: React.FC<AuthFormProps> = ({ isRegister, onSubmit, toggleForm, e
 // --- Componente del Panel de Usuario ---
 interface DashboardProps {
     user: UserData;
-    email: string;
     onLogout: () => void;
     onAddCredits: (amount: number) => void;
 }
 
-const Dashboard: React.FC<DashboardProps> = ({ user, email, onLogout, onAddCredits }) => {
+const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, onAddCredits }) => {
     const [showPayPal, setShowPayPal] = useState(false);
     
-    const imageUrl = user.profileImage
-        ? `data:image/png;base64,${user.profileImage}`
+    const avatarUrl = user.avatar
+        ? pb.getFileUrl(user, user.avatar)
         : `data:image/svg+xml;base64,${btoa('<svg width="120" height="120" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="60" cy="60" r="58" stroke="rgba(255,255,255,0.2)" stroke-width="2"/><path d="M60 40L80 60L60 80L40 60L60 40Z" stroke="#00f2ea" stroke-width="2"/><path d="M50 70L60 80L70 70" stroke="#00f2ea" stroke-width="1"/></svg>')}`;
 
     const handlePayPalApprove = useCallback(async (data: any, actions: any) => {
@@ -254,9 +234,9 @@ const Dashboard: React.FC<DashboardProps> = ({ user, email, onLogout, onAddCredi
         <div className="auth-container dashboard-container">
             <h1 className="logo">betterimg<span>.art</span></h1>
             <h2>Panel de Usuario</h2>
-            <img src={imageUrl} alt="Avatar de perfil" className="profile-image" />
+            <img src={avatarUrl} alt="Avatar de perfil" className="profile-image" />
             <div className="user-info">
-                 <p><strong>Usuario:</strong> {email}</p>
+                 <p><strong>Usuario:</strong> {user.email}</p>
                  <p className="user-credits"><strong>Créditos:</strong> <span>{user.credits}</span></p>
             </div>
             
@@ -278,101 +258,105 @@ const Dashboard: React.FC<DashboardProps> = ({ user, email, onLogout, onAddCredi
 
 // --- Componente Principal de la Aplicación ---
 const App = () => {
-  const [currentUser, setCurrentUser] = useState<{email: string; data: UserData} | null>(null);
+  const [currentUser, setCurrentUser] = useState<UserData | null>(pb.authStore.model as UserData | null);
   const [isRegisterView, setIsRegisterView] = useState(false);
   const [error, setError] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
 
   useEffect(() => {
-    // Simular sesión persistente
-    const userEmail = sessionStorage.getItem('currentUser');
-    if (userEmail) {
-      const users = getUsers();
-      if(users[userEmail]) {
-        setCurrentUser({ email: userEmail, data: users[userEmail] });
-      }
+    // Subscribe to authStore changes
+    const unsubscribe = pb.authStore.onChange((token, model) => {
+      setCurrentUser(model as UserData | null);
+    }, true);
+
+    return () => {
+      // Unsubscribe on cleanup
+      unsubscribe();
+    };
+  }, []);
+
+  const handleAddCredits = useCallback(async (amount: number) => {
+    if (!currentUser) return;
+
+    try {
+      const newCredits = (currentUser.credits || 0) + amount;
+      const updatedUser = await pb.collection('users').update<UserData>(currentUser.id, {
+        credits: newCredits,
+      });
+      setCurrentUser(updatedUser); // Update local state
+    } catch (err: any) {
+      console.error("Failed to add credits:", err);
+      setError('Error al añadir créditos. Inténtalo de nuevo.');
     }
-  }, []);
-
-  const handleAddCredits = useCallback((amount: number) => {
-    setCurrentUser(prevUser => {
-        if (!prevUser) return null;
-
-        const users = getUsers();
-        const userEmail = prevUser.email;
-        const userData = users[userEmail];
-
-        if (userData) {
-            const updatedUserData: UserData = {
-                ...userData,
-                credits: userData.credits + amount
-            };
-            
-            const updatedUsers = { ...users, [userEmail]: updatedUserData };
-            saveUsers(updatedUsers);
-
-            return { email: userEmail, data: updatedUserData };
-        }
-        return prevUser;
-    });
-  }, []);
+  }, [currentUser]);
 
   const handleRegister = async (email: string, password: string) => {
     setError('');
-    const users = getUsers();
-    if (users[email]) {
-      setError("Este correo electrónico ya está registrado.");
-      return;
-    }
-    
     setIsGenerating(true);
-    let profileImage: string | null = null;
+
     try {
-        const response = await ai.models.generateImages({
-            model: 'imagen-4.0-generate-001',
-            prompt: 'An abstract, artistic, futuristic avatar for a digital art platform. A glowing neon orb of creative energy, with vibrant cyan and magenta light trails on a dark, minimalist background. A sense of digital innovation and artistry. Logo-like simplicity.',
-            config: {
-                numberOfImages: 1,
-                outputMimeType: 'image/png',
-                aspectRatio: '1:1',
-            },
+        // 1. Create the user
+        const newUser = await pb.collection('users').create({
+            email,
+            password,
+            passwordConfirm: password,
+            credits: 10, // Initial credits
         });
-        profileImage = response.generatedImages[0].image.imageBytes;
-    } catch (e) {
-        console.error("AI image generation failed:", e);
-        setError("No se pudo generar el avatar. Inténtalo más tarde.");
-    }
 
-    const newUser: UserData = {
-        password: password, 
-        credits: 10,
-        profileImage: profileImage
-    };
+        // 2. Generate avatar
+        let avatarFile: File | null = null;
+        try {
+            const response = await ai.models.generateImages({
+                model: 'imagen-4.0-generate-001',
+                prompt: `An abstract, artistic, futuristic avatar for user ${email}. A glowing neon orb of creative energy, with vibrant cyan and magenta light trails on a dark, minimalist background. A sense of digital innovation and artistry. Logo-like simplicity.`,
+                config: {
+                    numberOfImages: 1,
+                    outputMimeType: 'image/png',
+                    aspectRatio: '1:1',
+                },
+            });
+            const imageBytes = response.generatedImages[0].image.imageBytes;
+            if (imageBytes) {
+                const blob = new Blob([Buffer.from(imageBytes, 'base64')], { type: 'image/png' });
+                avatarFile = new File([blob], "avatar.png", { type: 'image/png' });
+            }
+        } catch (e) {
+            console.error("AI image generation failed, proceeding without avatar:", e);
+            // Non-fatal, user is created, just without an avatar
+        }
 
-    const newUsers = { ...users, [email]: newUser };
-    saveUsers(newUsers);
-    setIsGenerating(false);
+        // 3. Update user with avatar if generated
+        if (avatarFile) {
+            const formData = new FormData();
+            formData.append('avatar', avatarFile);
+            await pb.collection('users').update(newUser.id, formData);
+        }
 
-    if (profileImage) { 
-      handleLogin(email, password); 
+        // 4. Automatically log in the new user
+        await handleLogin(email, password);
+
+    } catch (err: any) {
+        console.error("Registration failed:", err);
+        setError(err.message || "No se pudo registrar la cuenta.");
+    } finally {
+        setIsGenerating(false);
     }
   };
 
-  const handleLogin = (email: string, password: string) => {
+  const handleLogin = async (email: string, password: string) => {
     setError('');
-    const users = getUsers();
-    const userData = users[email];
-    if (userData && userData.password === password) {
-      setCurrentUser({ email, data: userData });
-      sessionStorage.setItem('currentUser', email);
-    } else {
+    try {
+      await pb.collection('users').authWithPassword(email, password);
+      // The authStore.onChange listener will handle setting the currentUser
+    } catch (err: any) {
+      console.error("Login failed:", err);
       setError("Correo electrónico o contraseña incorrectos.");
     }
   };
 
   const handleLogout = () => {
-    setCurrentUser(null);
-    sessionStorage.removeItem('currentUser');
+    pb.authStore.clear();
+    // The authStore.onChange listener will handle setting currentUser to null
     setError('');
     setIsRegisterView(false);
   };
@@ -380,8 +364,7 @@ const App = () => {
   if (currentUser) {
     return (
       <Dashboard
-        user={currentUser.data}
-        email={currentUser.email}
+        user={currentUser}
         onLogout={handleLogout}
         onAddCredits={handleAddCredits}
       />
